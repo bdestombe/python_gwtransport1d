@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -6,7 +5,9 @@ from scipy.optimize import minimize
 from gwtransport1d.residence_time import residence_time_retarded
 
 
-def compute_deposition(cout, flow, aquifer_pore_volume, porosity, thickness, retardation_factor):
+def compute_deposition(
+    cout, flow, aquifer_pore_volume, porosity, thickness, retardation_factor, nullspace_objective="squared_lengths"
+):
     """
     Compute the deposition given the added concentration of the compound in the extracted water.
 
@@ -24,6 +25,8 @@ def compute_deposition(cout, flow, aquifer_pore_volume, porosity, thickness, ret
         Thickness of the aquifer [m].
     retardation_factor : float
         Retardation factor of the compound in the aquifer [dimensionless].
+    nullspace_objective : str or callable, optional
+        Objective to minimize in the nullspace. If a string, it should be either "squared_lengths" or "summed_lengths". If a callable, it should take the form `objective(x, xLS, colsOfNullspace)`. Default is "squared_lengths".
 
     Returns
     -------
@@ -31,7 +34,7 @@ def compute_deposition(cout, flow, aquifer_pore_volume, porosity, thickness, ret
         Deposition of the compound in the aquifer [ng/m2/day].
     """
     # concentration extracted water is coeff dot deposition
-    df_out, coeff = deposition_coefficients(
+    _, coeff = deposition_coefficients(
         flow, aquifer_pore_volume, porosity=porosity, thickness=thickness, retardation_factor=retardation_factor
     )
 
@@ -45,12 +48,32 @@ def compute_deposition(cout, flow, aquifer_pore_volume, porosity, thickness, ret
     # Pick a solution in the nullspace that meets new objective
     def objective(x, xLS, colsOfNullspace):
         sols = xLS + colsOfNullspace @ x
-        return np.abs(sols[1:] - sols[:-1]).sum()
+        return np.square(sols[1:] - sols[:-1]).sum()
 
     deposition_0 = np.zeros(nullrank)
     res = minimize(objective, x0=deposition_0, args=(deposition_ls, colsOfNullspace), method="BFGS")
+
+    if not res.success:
+        msg = f"Optimization failed: {res.message}"
+        raise ValueError(msg)
+
+    # Squared lengths is stable to solve, thus good starting point
+    if nullspace_objective != "squared_lengths":
+        if nullspace_objective == "summed_lengths":
+
+            def objective(x, xLS, colsOfNullspace):
+                sols = xLS + colsOfNullspace @ x
+                return np.abs(sols[1:] - sols[:-1]).sum()
+
+            res = minimize(objective, x0=res.x, args=(deposition_ls, colsOfNullspace), method="BFGS")
+        elif callable(nullspace_objective):
+            res = minimize(nullspace_objective, x0=res.x, args=(deposition_ls, colsOfNullspace), method="BFGS")
+        else:
+            msg = f"Unknown nullspace objective: {nullspace_objective}"
+            raise ValueError(msg)
+
     deposition_data = deposition_ls + colsOfNullspace @ res.x
-    return pd.Series(data=deposition_data, index=df.index, name="deposition")
+    return pd.Series(data=deposition_data, index=flow.index, name="deposition")
 
 
 def compute_concentration(deposition, flow, aquifer_pore_volume, porosity, thickness, retardation_factor):
@@ -121,12 +144,12 @@ def deposition_coefficients(flow, aquifer_pore_volume, porosity, thickness, reta
     dt = np.zeros((nout, nin), dtype=float)
 
     for iout, (date_extraction, row) in enumerate(df_out.iterrows()):
-        itinf = df.index.searchsorted(row.dates_infiltration_retarded)  # partial day
-        itextr = df.index.searchsorted(date_extraction)  # whole day
-        dt[iout, itinf : itextr + 1] = 1.0  # df.ddates[itinf : itextr + 1]
+        itinf = flow.index.searchsorted(row.dates_infiltration_retarded)  # partial day
+        itextr = flow.index.searchsorted(date_extraction)  # whole day
+        dt[iout, itinf : itextr + 1] = 1.0
 
         # fraction of first day
-        dt[iout, itinf] = -(row.dates_infiltration_retarded - df.index[itinf]) / pd.to_timedelta(1.0, unit="D")
+        dt[iout, itinf] = -(row.dates_infiltration_retarded - flow.index[itinf]) / pd.to_timedelta(1.0, unit="D")
 
     coeff = (df_out.darea / df_out.flow).values[:, None] * dt
     return df_out, coeff
@@ -173,37 +196,3 @@ def nullspace(coefficients, atol=1e-13, rtol=0):
     tol = max(atol, rtol * s[0])
     nnz = (s >= tol).sum()
     return vh[nnz:].conj().T
-
-
-# Flow data
-dates = pd.date_range("2020-01-01 23:59:59", periods=400)  # Volume extracted during past day
-ddates = (dates[1:] - dates[:-1]) / np.timedelta64(1, "D")  # days
-
-if not (ddates == 1.0).all():
-    error_message = "date differences should be equal to 1 day for all elements."
-    raise ValueError(error_message)
-
-flow = pd.Series(300.0 * 24, index=dates, name="flow")  # m3
-flow[100:200] = 505.0 * 24
-flow[200:300] = 83.0 * 24
-
-residence_time_avg = 35.3  # days
-
-u = 1.0  # ng/m2/day
-
-df = pd.DataFrame({"flow": flow, "deposition": u})
-
-# Aquifer properties
-porosity = 0.3  # dimensionless
-thickness = 15.0  # m
-retardation_factor = 2.1  # dimensionless
-
-aquifer_pore_volume = df.flow.mean() * residence_time_avg  # m3
-aquifer_volume = aquifer_pore_volume / porosity  # m3
-aquifer_surface_area = aquifer_volume / thickness  # m2
-
-# compute concentration of the compound in the extracted water given the deposition
-cout = compute_concentration(df.deposition, df.flow, aquifer_pore_volume, porosity, thickness, retardation_factor)
-
-# compute deposition given the added concentration of the compound in the extracted water
-deposition = compute_deposition(cout, df.flow, aquifer_pore_volume, porosity, thickness, retardation_factor)
