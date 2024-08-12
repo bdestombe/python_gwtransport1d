@@ -57,7 +57,7 @@ def compute_deposition(
         msg = f"Optimization failed: {res.message}"
         raise ValueError(msg)
 
-    # Squared lengths is stable to solve, thus good starting point
+    # Squared lengths is stable to solve, thus a good starting point
     if nullspace_objective != "squared_lengths":
         if nullspace_objective == "summed_lengths":
 
@@ -66,8 +66,10 @@ def compute_deposition(
                 return np.abs(sols[1:] - sols[:-1]).sum()
 
             res = minimize(objective, x0=res.x, args=(deposition_ls, colsOfNullspace), method="BFGS")
+
         elif callable(nullspace_objective):
             res = minimize(nullspace_objective, x0=res.x, args=(deposition_ls, colsOfNullspace), method="BFGS")
+
         else:
             msg = f"Unknown nullspace objective: {nullspace_objective}"
             raise ValueError(msg)
