@@ -11,6 +11,12 @@ def compute_deposition(
     """
     Compute the deposition given the added concentration of the compound in the extracted water.
 
+    The length of flow should already correspond to the length of cout:
+
+    >>> start = cout.index.min() - pd.to_timedelta(rt_extraction[cout.index.min()], "D").ceil("D")
+    >>> end = cout.index.max()
+    >>> flow = flow.resample("D", label="right").median().loc[start:end]
+
     Parameters
     ----------
     cout : pandas.Series
@@ -37,6 +43,12 @@ def compute_deposition(
     _, coeff = deposition_coefficients(
         flow, aquifer_pore_volume, porosity=porosity, thickness=thickness, retardation_factor=retardation_factor
     )
+
+    # cout should be of length coeff.shape[0]
+    if len(cout) != coeff.shape[0]:
+        msg = f"Length of cout ({len(cout)}) should be equal to the number of rows in coeff ({coeff.shape[0]})"
+        msg += f"Either "
+        raise ValueError(msg)
 
     # Underdetermined least squares solution
     deposition_ls, *_ = np.linalg.lstsq(coeff, cout, rcond=None)
@@ -153,7 +165,14 @@ def deposition_coefficients(flow, aquifer_pore_volume, porosity, thickness, reta
         # fraction of first day
         dt[iout, itinf] = -(row.dates_infiltration_retarded - flow.index[itinf]) / pd.to_timedelta(1.0, unit="D")
 
+    flow_floor = flow.median() / 100.0  # m3/day To increase numerical stability
+    df_out["flow"] = df_out.flow.clip(lower=flow_floor)
     coeff = (df_out.darea / df_out.flow).values[:, None] * dt
+
+    if np.isnan(coeff).any():
+        msg = "Coefficients contain nan values."
+        raise ValueError(msg)
+
     return df_out, coeff
 
 
