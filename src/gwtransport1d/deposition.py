@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+from scipy import interpolate
+from scipy.linalg import null_space
 from scipy.optimize import minimize
 
 from gwtransport1d.residence_time import residence_time_retarded
@@ -13,7 +15,9 @@ def compute_deposition(
 
     The length of flow should already correspond to the length of cout:
 
-    >>> start = cout.index.min() - pd.to_timedelta(rt_extraction[cout.index.min()], "D").ceil("D")
+    >>> start = cout.index.min() - pd.to_timedelta(
+    ...     rt_extraction[cout.index.min()], "D"
+    ... ).ceil("D")
     >>> end = cout.index.max()
     >>> flow = flow.resample("D", label="right").median().loc[start:end]
 
@@ -40,21 +44,29 @@ def compute_deposition(
         Deposition of the compound in the aquifer [ng/m2/day].
     """
     # concentration extracted water is coeff dot deposition
-    _, coeff = deposition_coefficients(
-        flow, aquifer_pore_volume, porosity=porosity, thickness=thickness, retardation_factor=retardation_factor
+    coeff, _, index_dep = deposition_coefficients(
+        cout.index,
+        flow,
+        aquifer_pore_volume,
+        porosity=porosity,
+        thickness=thickness,
+        retardation_factor=retardation_factor,
     )
 
     # cout should be of length coeff.shape[0]
     if len(cout) != coeff.shape[0]:
         msg = f"Length of cout ({len(cout)}) should be equal to the number of rows in coeff ({coeff.shape[0]})"
-        msg += f"Either "
         raise ValueError(msg)
+
+    if not index_dep.isin(flow.index).all():
+        msg = "The flow timeseries is either not long enough or is not alligned well"
+        raise ValueError(msg, index_dep, flow.index)
 
     # Underdetermined least squares solution
     deposition_ls, *_ = np.linalg.lstsq(coeff, cout, rcond=None)
 
     # Nullspace -> multiple solutions exist, deposition_ls is just one of them
-    colsOfNullspace = nullspace(coeff)
+    colsOfNullspace = null_space(coeff, rcond=None)
     nullrank = colsOfNullspace.shape[1]
 
     # Pick a solution in the nullspace that meets new objective
@@ -87,15 +99,17 @@ def compute_deposition(
             raise ValueError(msg)
 
     deposition_data = deposition_ls + colsOfNullspace @ res.x
-    return pd.Series(data=deposition_data, index=flow.index, name="deposition")
+    return pd.Series(data=deposition_data, index=index_dep, name="deposition")
 
 
-def compute_concentration(deposition, flow, aquifer_pore_volume, porosity, thickness, retardation_factor):
+def compute_dc(dcout_index, deposition, flow, aquifer_pore_volume, porosity, thickness, retardation_factor):
     """
-    Compute the concentration of the compound in the extracted water given the deposition.
+    Compute the increase in concentration of the compound in the extracted water by the deposition.
 
     Parameters
     ----------
+    dcout_index : pandas.Series
+        Concentration of the compound in the extracted water [ng/m3].
     deposition : pandas.Series
         Deposition of the compound in the aquifer [ng/m2/day].
     flow : pandas.Series
@@ -112,20 +126,26 @@ def compute_concentration(deposition, flow, aquifer_pore_volume, porosity, thick
     pandas.Series
         Concentration of the compound in the extracted water [ng/m3].
     """
-    _, coeff = deposition_coefficients(
-        flow, aquifer_pore_volume, porosity=porosity, thickness=thickness, retardation_factor=retardation_factor
+    coeff, _, index = deposition_coefficients(
+        dcout_index,
+        flow,
+        aquifer_pore_volume,
+        porosity=porosity,
+        thickness=thickness,
+        retardation_factor=retardation_factor,
     )
-    rt = residence_time_retarded(flow, aquifer_pore_volume, retardation_factor=retardation_factor)
-    valid_rt_mask = rt.notnull()
-    return pd.Series(coeff @ deposition, index=flow.index[valid_rt_mask], name="cout")
+    coeff_overlapping = coeff[:, index.isin(deposition.index)]  # what if coeff is smaller than deposition?
+    return pd.Series(coeff_overlapping @ deposition, index=dcout_index, name="dcout")
 
 
-def deposition_coefficients(flow, aquifer_pore_volume, porosity, thickness, retardation_factor):
+def deposition_coefficients(dcout_index, flow, aquifer_pore_volume, porosity, thickness, retardation_factor):
     """
     Compute the coefficients of the deposition model.
 
     Parameters
     ----------
+    dcout_index : pandas.Series
+        Concentration of the compound in the extracted water [ng/m3].
     flow : pandas.Series
         Flow rate of water in the aquifer [m3/day].
     aquifer_pore_volume : float
@@ -139,81 +159,68 @@ def deposition_coefficients(flow, aquifer_pore_volume, porosity, thickness, reta
 
     Returns
     -------
-    pandas.DataFrame
-        Dataframe containing the residence time of the retarded compound in the aquifer [days].
     numpy.ndarray
         Coefficients of the deposition model [m2/day].
+    pandas.DataFrame
+        Dataframe containing the residence time of the retarded compound in the aquifer [days].
+    pandas.DatetimeIndex
+        Datetime index of the deposition.
     """
-    rt = residence_time_retarded(flow, aquifer_pore_volume, retardation_factor=retardation_factor)
-    valid_rt_mask = rt.notnull()
-    df_out = pd.DataFrame(data={"rt": rt[valid_rt_mask].copy(), "flow": flow[valid_rt_mask].copy()})
-    df_out["dates_infiltration_retarded"] = df_out.index - pd.to_timedelta(df_out.rt, unit="D")
 
-    # Aquifer area cathing deposition
-    df_out["darea"] = df_out.flow / (retardation_factor * porosity * thickness)
+    def interp(df, index_new):
+        df = df[df.index.notna()]
+        dt = (df.index - df.index[0]) / pd.to_timedelta(1, unit="D")
+        dt_interp = (index_new - df.index[0]) / pd.to_timedelta(1, unit="D")
+        interp_obj = interpolate.interp1d(dt, df.values, bounds_error=False)
+        return interp_obj(dt_interp)
+
+    # Get deposition indices
+    rt = residence_time_retarded(
+        flow, aquifer_pore_volume, retardation_factor=retardation_factor, direction="extraction"
+    )
+    rt_at_start_cout = pd.to_timedelta(interp(rt, dcout_index.min()), "D")
+    start_dep = (dcout_index.min() - rt_at_start_cout).floor("D")
+    end_dep = dcout_index.max()
+    index_dep = pd.date_range(start=start_dep, end=end_dep, freq="D")
+
+    if not index_dep.isin(flow.index).all():
+        msg = "The flow timeseries is either not long enough or is not alligned well"
+        raise ValueError(msg, index_dep, flow.index)
+
+    df = pd.DataFrame(
+        data={
+            "flow": flow[dcout_index.floor(freq="D")].values,
+            "rt": pd.to_timedelta(interp(rt, dcout_index), "D"),
+            "dates_infiltration_retarded": dcout_index - pd.to_timedelta(interp(rt, dcout_index), "D"),
+            "darea": flow[dcout_index.floor(freq="D")].values
+            / (retardation_factor * porosity * thickness),  # Aquifer area cathing deposition
+        },
+        index=dcout_index,
+    )
 
     # Compute coefficients
-    nin = len(flow)
-    nout = len(df_out)
-    dt = np.zeros((nout, nin), dtype=float)
+    dt = np.zeros((len(dcout_index), len(index_dep)), dtype=float)
 
-    for iout, (date_extraction, row) in enumerate(df_out.iterrows()):
-        itinf = flow.index.searchsorted(row.dates_infiltration_retarded)  # partial day
-        itextr = flow.index.searchsorted(date_extraction)  # whole day
-        dt[iout, itinf : itextr + 1] = 1.0
+    for iout, (date_extraction, row) in enumerate(df.iterrows()):
+        itinf = index_dep.searchsorted(row.dates_infiltration_retarded.floor(freq="D"))  # partial day
+        itextr = index_dep.searchsorted(date_extraction.floor(freq="D"))  # whole day
+
+        dt[iout, itinf] = (index_dep[itinf + 1] - row.dates_infiltration_retarded) / pd.to_timedelta(1.0, unit="D")
+        dt[iout, itinf + 1 : itextr] = 1.0
 
         # fraction of first day
-        dt[iout, itinf] = -(row.dates_infiltration_retarded - flow.index[itinf]) / pd.to_timedelta(1.0, unit="D")
+        dt[iout, itextr] = (date_extraction - index_dep[itextr]) / pd.to_timedelta(1.0, unit="D")
+
+    if not np.isclose(dt.sum(axis=1), df.rt.values / pd.to_timedelta(1.0, unit="D")).all():
+        msg = "Residence times do not match"
+        raise ValueError(msg)
 
     flow_floor = flow.median() / 100.0  # m3/day To increase numerical stability
-    df_out["flow"] = df_out.flow.clip(lower=flow_floor)
-    coeff = (df_out.darea / df_out.flow).values[:, None] * dt
+    flow_floored = df.flow.clip(lower=flow_floor)
+    coeff = (df.darea / flow_floored).values[:, None] * dt
 
     if np.isnan(coeff).any():
         msg = "Coefficients contain nan values."
         raise ValueError(msg)
 
-    return df_out, coeff
-
-
-def nullspace(coefficients, atol=1e-13, rtol=0):
-    """Compute an approximate basis for the nullspace of A.
-
-    The algorithm used by this function is based on the singular value
-    decomposition of `A`.
-
-    Parameters
-    ----------
-    coefficients : ndarray
-        A should be at most 2-D.  A 1-D array with length k will be treated
-        as a 2-D with shape (1, k)
-    atol : float
-        The absolute tolerance for a zero singular value.  Singular values
-        smaller than `atol` are considered to be zero.
-    rtol : float
-        The relative tolerance.  Singular values less than rtol*smax are
-        considered to be zero, where smax is the largest singular value.
-
-    If both `atol` and `rtol` are positive, the combined tolerance is the
-    maximum of the two; that is::
-        tol = max(atol, rtol * smax)
-    Singular values smaller than `tol` are considered to be zero.
-
-    Return value
-    ------------
-    numpy.ndarray
-        If `A` is an array with shape (m, k), then `ns` will be an array
-        with shape (k, n), where n is the estimated dimension of the
-        nullspace of `A`.  The columns of `ns` are a basis for the
-        nullspace; each element in numpy.dot(A, ns) will be approximately
-        zero.
-
-    Notes
-    -----
-    Source: https://scipy-cookbook.readthedocs.io/items/RankNullspace.html
-    """
-    coefficients = np.atleast_2d(coefficients)
-    _, s, vh = np.linalg.svd(coefficients)
-    tol = max(atol, rtol * s[0])
-    nnz = (s >= tol).sum()
-    return vh[nnz:].conj().T
+    return coeff, df, index_dep

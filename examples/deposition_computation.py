@@ -54,7 +54,9 @@ ax[0].set_ylabel("Concentration [ng/m3]")
 ax[0].legend(loc="upper left")
 
 ax0r = ax[0].twinx()
-ax0r.plot(measurements.index, measurements.deposition, label="Measurements", color="C1", marker="o", markevery=(0., 0.1))
+ax0r.plot(
+    measurements.index, measurements.deposition, label="Measurements", color="C1", marker="o", markevery=(0.0, 0.1)
+)
 ax0r.plot(modeled_deposition.index, modeled_deposition, label="Model", color="C2", marker="*", markevery=(0.05, 0.1))
 ax0r.set_ylim(0, 1.2 * measurements.deposition.max())
 ax0r.set_ylabel("Deposition [ng/m2/day]")
