@@ -1,3 +1,27 @@
+"""
+Deposition and Concentration Analysis for Aquifer Systems.
+
+This module provides functions to analyze compound deposition and concentration
+in aquifer systems. It includes tools for computing deposition rates, concentration
+changes, and related coefficients based on extraction data and aquifer properties.
+
+The model assumes requires the groundwaterflow to be reduced to a 1D system. On one side,
+water with a certain concentration infiltrates ('cin'), the water flows through the aquifer and
+the compound of intrest flows through the aquifer with a retarded velocity. During the soil pasage,
+deposition enriches the water with the compound. The water is extracted ('cout') and the concentration
+increase due to deposition is called 'dcout'.
+
+Main functions:
+- compute_deposition: Calculate deposition rates from extraction data
+- compute_dc: Determine concentration changes due to deposition
+- deposition_coefficients: Generate coefficients for deposition modeling
+- interp_series: Interpolate time series data to new time points
+
+The module leverages numpy, pandas, and scipy for efficient numerical computations
+and time series handling. It is designed for researchers and engineers working on
+groundwater contamination and transport problems.
+"""
+
 import numpy as np
 import pandas as pd
 from scipy import interpolate
@@ -66,16 +90,16 @@ def compute_deposition(
     deposition_ls, *_ = np.linalg.lstsq(coeff, cout, rcond=None)
 
     # Nullspace -> multiple solutions exist, deposition_ls is just one of them
-    colsOfNullspace = null_space(coeff, rcond=None)
-    nullrank = colsOfNullspace.shape[1]
+    cols_of_nullspace = null_space(coeff, rcond=None)
+    nullrank = cols_of_nullspace.shape[1]
 
     # Pick a solution in the nullspace that meets new objective
-    def objective(x, xLS, colsOfNullspace):
-        sols = xLS + colsOfNullspace @ x
+    def objective(x, x_ls, cols_of_nullspace):
+        sols = x_ls + cols_of_nullspace @ x
         return np.square(sols[1:] - sols[:-1]).sum()
 
     deposition_0 = np.zeros(nullrank)
-    res = minimize(objective, x0=deposition_0, args=(deposition_ls, colsOfNullspace), method="BFGS")
+    res = minimize(objective, x0=deposition_0, args=(deposition_ls, cols_of_nullspace), method="BFGS")
 
     if not res.success:
         msg = f"Optimization failed: {res.message}"
@@ -85,20 +109,20 @@ def compute_deposition(
     if nullspace_objective != "squared_lengths":
         if nullspace_objective == "summed_lengths":
 
-            def objective(x, xLS, colsOfNullspace):
-                sols = xLS + colsOfNullspace @ x
+            def objective(x, x_ls, cols_of_nullspace):
+                sols = x_ls + cols_of_nullspace @ x
                 return np.abs(sols[1:] - sols[:-1]).sum()
 
-            res = minimize(objective, x0=res.x, args=(deposition_ls, colsOfNullspace), method="BFGS")
+            res = minimize(objective, x0=res.x, args=(deposition_ls, cols_of_nullspace), method="BFGS")
 
         elif callable(nullspace_objective):
-            res = minimize(nullspace_objective, x0=res.x, args=(deposition_ls, colsOfNullspace), method="BFGS")
+            res = minimize(nullspace_objective, x0=res.x, args=(deposition_ls, cols_of_nullspace), method="BFGS")
 
         else:
             msg = f"Unknown nullspace objective: {nullspace_objective}"
             raise ValueError(msg)
 
-    deposition_data = deposition_ls + colsOfNullspace @ res.x
+    deposition_data = deposition_ls + cols_of_nullspace @ res.x
     return pd.Series(data=deposition_data, index=index_dep, name="deposition")
 
 
@@ -126,16 +150,67 @@ def compute_dc(dcout_index, deposition, flow, aquifer_pore_volume, porosity, thi
     pandas.Series
         Concentration of the compound in the extracted water [ng/m3].
     """
-    coeff, _, index = deposition_coefficients(
-        dcout_index,
+    cout_date_range = dcout_date_range_from_dcout_index(dcout_index)
+    coeff, _, _dep_index = deposition_coefficients(
+        cout_date_range,
         flow,
         aquifer_pore_volume,
         porosity=porosity,
         thickness=thickness,
         retardation_factor=retardation_factor,
     )
-    coeff_overlapping = coeff[:, index.isin(deposition.index)]  # what if coeff is smaller than deposition?
-    return pd.Series(coeff_overlapping @ deposition, index=dcout_index, name="dcout")
+    # coeff_overlapping = coeff[:, index.isin(deposition.index)]  # what if coeff is smaller than deposition?
+    return pd.Series(coeff @ deposition, index=dcout_index, name="dcout")
+
+
+def dcout_date_range_from_dcout_index(dcout_index):
+    """
+    Compute the date range of the concentration of the compound in the extracted water.
+
+    Parameters
+    ----------
+    dcout_index : pandas.DatetimeIndex
+        Index of the concentration of the compound in the extracted water.
+
+    Returns
+    -------
+    pandas.DatetimeIndex
+        Date range of the concentration of the compound in the extracted water.
+    """
+    return pd.date_range(start=dcout_index.min().floor("D"), end=dcout_index.max(), freq="D")
+
+
+def deposition_index_from_dcout_index(dcout_index, flow, aquifer_pore_volume, retardation_factor):
+    """
+    Compute the index of the deposition from the concentration of the compound in the extracted water index.
+
+    Creates and index for each day, starting at the first day that contributes to the first dcout measurement,
+    and ending at the last day that contributes to the last dcout measurement. The times are floored to the
+    beginning of the day.
+
+    Parameters
+    ----------
+    dcout_index : pandas.DatetimeIndex
+        Index of the concentration of the compound in the extracted water.
+    flow : pandas.Series
+        Flow rate of water in the aquifer [m3/day].
+    aquifer_pore_volume : float
+        Pore volume of the aquifer [m3].
+    retardation_factor : float
+        Retardation factor of the compound in the aquifer [dimensionless].
+
+    Returns
+    -------
+    pandas.DatetimeIndex
+        Index of the deposition.
+    """
+    rt = residence_time_retarded(
+        flow, aquifer_pore_volume, retardation_factor=retardation_factor, direction="extraction"
+    )
+    rt_at_start_cout = pd.to_timedelta(interp_series(rt, dcout_index.min()), "D")
+    start_dep = (dcout_index.min() - rt_at_start_cout).floor("D")
+    end_dep = dcout_index.max()
+    return pd.date_range(start=start_dep, end=end_dep, freq="D")
 
 
 def deposition_coefficients(dcout_index, flow, aquifer_pore_volume, porosity, thickness, retardation_factor):
@@ -166,22 +241,15 @@ def deposition_coefficients(dcout_index, flow, aquifer_pore_volume, porosity, th
     pandas.DatetimeIndex
         Datetime index of the deposition.
     """
-
-    def interp(df, index_new):
-        df = df[df.index.notna()]
-        dt = (df.index - df.index[0]) / pd.to_timedelta(1, unit="D")
-        dt_interp = (index_new - df.index[0]) / pd.to_timedelta(1, unit="D")
-        interp_obj = interpolate.interp1d(dt, df.values, bounds_error=False)
-        return interp_obj(dt_interp)
-
     # Get deposition indices
     rt = residence_time_retarded(
         flow, aquifer_pore_volume, retardation_factor=retardation_factor, direction="extraction"
     )
-    rt_at_start_cout = pd.to_timedelta(interp(rt, dcout_index.min()), "D")
-    start_dep = (dcout_index.min() - rt_at_start_cout).floor("D")
-    end_dep = dcout_index.max()
-    index_dep = pd.date_range(start=start_dep, end=end_dep, freq="D")
+    # rt_at_start_cout = pd.to_timedelta(interp_series(rt, dcout_index.min()), "D")
+    # start_dep = (dcout_index.min() - rt_at_start_cout).floor("D")
+    # end_dep = dcout_index.max()
+    # index_dep = pd.date_range(start=start_dep, end=end_dep, freq="D")
+    index_dep = deposition_index_from_dcout_index(dcout_index, flow, aquifer_pore_volume, retardation_factor)
 
     if not index_dep.isin(flow.index).all():
         msg = "The flow timeseries is either not long enough or is not alligned well"
@@ -190,8 +258,8 @@ def deposition_coefficients(dcout_index, flow, aquifer_pore_volume, porosity, th
     df = pd.DataFrame(
         data={
             "flow": flow[dcout_index.floor(freq="D")].values,
-            "rt": pd.to_timedelta(interp(rt, dcout_index), "D"),
-            "dates_infiltration_retarded": dcout_index - pd.to_timedelta(interp(rt, dcout_index), "D"),
+            "rt": pd.to_timedelta(interp_series(rt, dcout_index), "D"),
+            "dates_infiltration_retarded": dcout_index - pd.to_timedelta(interp_series(rt, dcout_index), "D"),
             "darea": flow[dcout_index.floor(freq="D")].values
             / (retardation_factor * porosity * thickness),  # Aquifer area cathing deposition
         },
@@ -224,3 +292,39 @@ def deposition_coefficients(dcout_index, flow, aquifer_pore_volume, porosity, th
         raise ValueError(msg)
 
     return coeff, df, index_dep
+
+def interp_series(series, index_new, **interp1d_kwargs):
+    """
+    Interpolate a pandas.Series to a new index.
+
+    Parameters
+    ----------
+    series : pandas.Series
+        Series to interpolate.
+    index_new : pandas.DatetimeIndex
+        New index to interpolate to.
+    interp1d_kwargs : dict, optional
+        Keyword arguments passed to scipy.interpolate.interp1d. Default is {}.
+
+    Returns
+    -------
+    pandas.Series
+        Interpolated series.
+    """
+    if not isinstance(series, pd.Series):
+        msg = "Input should be a pandas.Series"
+        raise TypeError(msg)
+
+    if not isinstance(series.index, pd.DatetimeIndex):
+        msg = "series should have a pandas.DatetimeIndex"
+        raise TypeError(msg)
+
+    if not isinstance(index_new, pd.DatetimeIndex):
+        msg = "index_new should be a pandas.DatetimeIndex"
+        raise TypeError(msg)
+
+    series = series[series.index.notna() & series.notna()]
+    dt = (series.index - series.index[0]) / pd.to_timedelta(1, unit="D")
+    dt_interp = (index_new - series.index[0]) / pd.to_timedelta(1, unit="D")
+    interp_obj = interpolate.interp1d(dt, series.values, bounds_error=False, **interp1d_kwargs)
+    return pd.Series(interp_obj(dt_interp), index=index_new, name=series.name)
