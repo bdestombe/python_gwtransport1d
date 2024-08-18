@@ -1,3 +1,18 @@
+"""
+Residence time of a compound in the aquifer.
+
+This module provides functions to compute the residence time of a compound in the aquifer.
+The residence time is the time it takes for the compound to travel from the infiltration
+point to the extraction point. The compound is retarded in the aquifer with a retardation factor.
+
+Main functions:
+- residence_time_retarded: Compute the residence time of a retarded compound in the aquifer.
+
+The module leverages numpy, pandas, and scipy for efficient numerical computations
+and time series handling. It is designed for researchers and engineers working on
+groundwater contamination and transport problems.
+"""
+
 import numpy as np
 import pandas as pd
 
